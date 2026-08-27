@@ -1,0 +1,63 @@
+name: Restore complete Sharky Pizza Run
+
+on:
+  push:
+    paths:
+      - '.github/workflows/restore-complete-pizza-run.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v4
+        with:
+          path: target
+
+      - name: Checkout exact May 8 source commit
+        uses: actions/checkout@v4
+        with:
+          repository: mrgamerdu84-ctrl/la-jungle-de-l-arcade
+          ref: 179b57fd705898f313d6225c82b389522d6ab8f0
+          token: ${{ secrets.GITHUB_PAT || secrets.Token }}
+          path: source
+          fetch-depth: 1
+
+      - name: Copy complete Pizza Run files unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p target/src/games target/src/routes target/src/assets target/public
+          cp source/src/games/SharkyPizzaRun.tsx target/src/games/SharkyPizzaRun.tsx
+          cp source/src/routes/games.pizza-run.tsx target/src/routes/games.pizza-run.tsx
+          cp source/src/assets/sharky-scooter.png target/src/assets/sharky-scooter.png
+          cp source/src/assets/pizza-box.png target/src/assets/pizza-box.png
+          cp source/src/assets/city-bg.jpg target/src/assets/city-bg.jpg
+          cp source/src/assets/sharky-vip-music.mp3 target/src/assets/sharky-vip-music.mp3
+          cp source/public/vito.mp3 target/public/vito.mp3
+
+          echo 'Verifying exact Git blob hashes:'
+          test "$(git -C source hash-object src/games/SharkyPizzaRun.tsx)" = "$(git -C target hash-object src/games/SharkyPizzaRun.tsx)"
+          test "$(git -C source hash-object src/assets/city-bg.jpg)" = "$(git -C target hash-object src/assets/city-bg.jpg)"
+          test "$(git -C source hash-object src/assets/sharky-vip-music.mp3)" = "$(git -C target hash-object src/assets/sharky-vip-music.mp3)"
+          test "$(git -C source hash-object public/vito.mp3)" = "$(git -C target hash-object public/vito.mp3)"
+
+      - name: Commit exact restored game
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/games/SharkyPizzaRun.tsx src/routes/games.pizza-run.tsx src/assets/sharky-scooter.png src/assets/pizza-box.png src/assets/city-bg.jpg src/assets/sharky-vip-music.mp3 public/vito.mp3
+          if git diff --cached --quiet; then
+            echo 'Already restored.'
+            exit 0
+          fi
+          git commit -m 'restore: complete Sharky Pizza Run May 8 version'
+          git push origin main
