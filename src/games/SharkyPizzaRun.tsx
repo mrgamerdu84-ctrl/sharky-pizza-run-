@@ -1,1016 +1,1037 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  Clock,
-  Pause,
-  Pizza,
-  Play,
-  RotateCcw,
-  Trophy,
-  Volume2,
-  VolumeX,
-} from "lucide-react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { Link } from "@tanstack/react-router";
+import { ArrowLeft, Trophy, Pizza, Clock } from "lucide-react";
+import { supabase } from "@/integrations/supabase/client";
 import scooterImg from "@/assets/sharky-scooter.png";
 import pizzaImg from "@/assets/pizza-box.png";
 
-type Kind =
-  | "pizza"
-  | "customer"
-  | "cone"
-  | "puddle"
-  | "trash"
-  | "car"
-  | "barrier"
-  | "rival"
-  | "roadblock"
-  | "turbo"
-  | "shield";
+/* ───────────────────────── Sharky Pizza Run ─────────────────────────
+   Side-scroller : Sharky en scooter livre des pizzas dans une rue qui
+   défile. 1 doigt = tap/maintien pour sauter. Esquive les obstacles
+   (plots, voitures, flaques), collecte les pizzas (max 3 en stock),
+   livre aux clients (zone arc-en-ciel) avant la fin du timer.
+─────────────────────────────────────────────────────────────────────── */
 
-type Entity = {
+type ObstacleKind = "cone" | "puddle" | "trash" | "car";
+type EntityKind = "pizza" | "customer" | ObstacleKind;
+
+interface Entity {
   x: number;
   y: number;
   w: number;
   h: number;
-  kind: Kind;
+  kind: EntityKind;
   alive: boolean;
   phase: number;
-  color?: string;
-  vx?: number;
-};
+  customerColor?: string; // pour les clients
+  lane?: 0 | 1; // 0 = sol, 1 = en l'air (pour les pizzas)
+}
 
-type Pedestrian = {
-  x: number;
-  phase: number;
-  speed: number;
-  shirt: string;
-  skin: string;
-  scale: number;
-  wave: number;
-};
+interface Cloud {
+  x: number; y: number; scale: number; speed: number;
+}
+interface Building {
+  x: number; w: number; h: number; color: string; windowsCol: string;
+}
 
-type TrafficCar = {
-  x: number;
-  lane: 0 | 1;
-  dir: 1 | -1;
-  speed: number;
-  color: string;
-  type: "sedan" | "van" | "mini";
-};
+const GROUND_RATIO = 0.78; // y du sol (ratio de la hauteur)
+const GRAVITY = 2200;       // px/s²
+const JUMP_VY = -780;
+const JUMP_HOLD_BOOST = -60; // tant qu'on tient, petite poussée
+const JUMP_HOLD_MAX = 0.18;  // secondes
+const MAX_PIZZAS = 3;
+const ROUND_DURATION = 75;   // secondes
 
-type FloatText = {
-  x: number;
-  y: number;
-  text: string;
-  color: string;
-  life: number;
-};
+/* Sons procéduraux */
+function useSounds() {
+  const ctxRef = useRef<AudioContext | null>(null);
+  const ensure = () => {
+    if (!ctxRef.current) ctxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    if (ctxRef.current.state === "suspended") ctxRef.current.resume().catch(() => {});
+    return ctxRef.current;
+  };
+  const jump = () => {
+    const ctx = ensure();
+    const o = ctx.createOscillator(); const g = ctx.createGain();
+    o.type = "triangle";
+    o.frequency.setValueAtTime(360, ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(720, ctx.currentTime + 0.12);
+    g.gain.setValueAtTime(0.18, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+    o.connect(g).connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.16);
+  };
+  const pickup = () => {
+    const ctx = ensure();
+    [660, 990].forEach((f, i) => {
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.type = "triangle"; o.frequency.value = f;
+      const t = ctx.currentTime + i * 0.05;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.18, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+      o.connect(g).connect(ctx.destination);
+      o.start(t); o.stop(t + 0.16);
+    });
+  };
+  const deliver = () => {
+    const ctx = ensure();
+    [523, 659, 784, 1047].forEach((f, i) => {
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.type = "triangle"; o.frequency.value = f;
+      const t = ctx.currentTime + i * 0.07;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.22, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
+      o.connect(g).connect(ctx.destination);
+      o.start(t); o.stop(t + 0.3);
+    });
+  };
+  const crash = () => {
+    const ctx = ensure();
+    const o = ctx.createOscillator(); const g = ctx.createGain();
+    o.type = "sawtooth";
+    o.frequency.setValueAtTime(220, ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.4);
+    g.gain.setValueAtTime(0.3, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
+    o.connect(g).connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.5);
+  };
+  const horn = () => {
+    const ctx = ensure();
+    const o = ctx.createOscillator(); const g = ctx.createGain();
+    o.type = "square"; o.frequency.value = 280;
+    g.gain.setValueAtTime(0.12, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+    o.connect(g).connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.2);
+  };
+  return { jump, pickup, deliver, crash, horn };
+}
 
-type Runtime = {
-  sharkX: number;
-  sharkY: number;
-  vy: number;
-  onGround: boolean;
-  jumpHeld: boolean;
-  jumpHold: number;
-  speed: number;
-  distance: number;
-  score: number;
-  pizzas: number;
-  delivered: number;
-  combo: number;
-  timeLeft: number;
-  level: number;
-  lives: number;
-  invuln: number;
-  shield: number;
-  turbo: number;
-  started: boolean;
-  paused: boolean;
-  over: boolean;
-  win: boolean;
-  spawnTimer: number;
-  customerTimer: number;
-  rivalTimer: number;
-  roadblockTimer: number;
-  entities: Entity[];
-  pedestrians: Pedestrian[];
-  traffic: TrafficCar[];
-  floatTexts: FloatText[];
-  lastVitoLevel: number;
-  shake: number;
-};
+const CUSTOMER_COLORS = ["#fbbf24", "#22d3ee", "#a855f7", "#10b981", "#f472b6", "#fb923c"];
 
-const GROUND = 0.79;
-const GRAVITY = 2200;
-const JUMP_VY = -790;
-const MAX_PIZZAS = 5;
-const ROUND_DURATION = 100;
-const LEVEL_THRESHOLD = 3;
-const WIN_LEVEL = 10;
-const HIGH_SCORE_KEY = "sharky-pizza-run-high-score";
-const LEVEL_NAMES = [
-  "Apprenti",
-  "Coursier",
-  "Vétéran",
-  "Pro",
-  "Champion",
-  "Légende",
-  "Mythique",
-  "Élite",
-  "Maître",
-  "Champion ultime",
-];
-const SPEED_STEPS = [515, 560, 620, 690, 760, 835, 905, 975, 1035, 1100];
-const SPAWN_FLOORS = [0.97, 0.84, 0.7, 0.6, 0.51, 0.44, 0.37, 0.32, 0.27, 0.23];
-const COLORS = ["#ef4444", "#3b82f6", "#f59e0b", "#10b981", "#8b5cf6", "#ec4899"];
+export default function SharkyPizzaRun() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sounds = useSounds();
 
-const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
-const levelFromDeliveries = (delivered: number) => Math.min(WIN_LEVEL, 1 + Math.floor(delivered / LEVEL_THRESHOLD));
-const overlap = (a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) =>
-  a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  const [score, setScore] = useState(0);
+  const [pizzas, setPizzas] = useState(0);
+  const [delivered, setDelivered] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(ROUND_DURATION);
+  const [combo, setCombo] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [highScore, setHighScore] = useState(0);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [started, setStarted] = useState(false);
 
-function createRuntime(): Runtime {
-  return {
-    sharkX: 120,
+  const stateRef = useRef({
+    sharkX: 0,
     sharkY: 0,
-    vy: 0,
+    sharkVY: 0,
     onGround: true,
-    jumpHeld: false,
     jumpHold: 0,
-    speed: SPEED_STEPS[0],
+    jumping: false,
+    speed: 280,            // px/s, accélère lentement
     distance: 0,
     score: 0,
     pizzas: 0,
     delivered: 0,
     combo: 0,
     timeLeft: ROUND_DURATION,
-    level: 1,
-    lives: 3,
     invuln: 0,
-    shield: 0,
-    turbo: 0,
-    started: false,
-    paused: false,
-    over: false,
-    win: false,
-    spawnTimer: 0.7,
-    customerTimer: 3.4,
-    rivalTimer: 7,
-    roadblockTimer: 8,
-    entities: [],
-    pedestrians: [],
-    traffic: [],
-    floatTexts: [],
-    lastVitoLevel: 0,
     shake: 0,
-  };
-}
+    started: false,
+    gameOver: false,
+    flash: 0,
+    flashColor: "rgba(255,255,255,0)",
 
-function useArcadeAudio() {
-  const ctxRef = useRef<AudioContext | null>(null);
-  const mutedRef = useRef(false);
+    entities: [] as Entity[],
+    clouds: [] as Cloud[],
+    buildings: [] as Building[],
+    spawnTimer: 0,
+    customerTimer: 8,      // premier client après 8s
 
-  const ctx = useCallback(() => {
-    if (mutedRef.current) return null;
-    if (!ctxRef.current) {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return null;
-      ctxRef.current = new AudioCtx();
-    }
-    if (ctxRef.current.state === "suspended") ctxRef.current.resume().catch(() => {});
-    return ctxRef.current;
-  }, []);
-
-  const tone = useCallback((from: number, to: number, duration: number, volume = 0.12, type: OscillatorType = "triangle") => {
-    const c = ctx();
-    if (!c) return;
-    const o = c.createOscillator();
-    const g = c.createGain();
-    o.type = type;
-    o.frequency.setValueAtTime(from, c.currentTime);
-    o.frequency.exponentialRampToValueAtTime(Math.max(30, to), c.currentTime + duration);
-    g.gain.setValueAtTime(volume, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + duration);
-    o.connect(g).connect(c.destination);
-    o.start();
-    o.stop(c.currentTime + duration + 0.02);
-  }, [ctx]);
-
-  const jump = useCallback(() => tone(350, 760, 0.13, 0.13), [tone]);
-  const pickup = useCallback(() => {
-    tone(650, 920, 0.11, 0.12);
-    window.setTimeout(() => tone(920, 1240, 0.1, 0.09), 55);
-  }, [tone]);
-  const deliver = useCallback(() => {
-    tone(520, 820, 0.16, 0.14);
-    window.setTimeout(() => tone(780, 1180, 0.18, 0.12), 80);
-  }, [tone]);
-  const crash = useCallback(() => tone(180, 55, 0.35, 0.18, "sawtooth"), [tone]);
-  const siren = useCallback(() => {
-    tone(620, 850, 0.18, 0.07, "square");
-    window.setTimeout(() => tone(850, 620, 0.18, 0.06, "square"), 180);
-  }, [tone]);
-  const power = useCallback(() => tone(420, 1250, 0.28, 0.13), [tone]);
-
-  return {
-    jump,
-    pickup,
-    deliver,
-    crash,
-    siren,
-    power,
-    setMuted(v: boolean) { mutedRef.current = v; },
-  };
-}
-
-function roundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-  const rr = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + rr, y);
-  ctx.arcTo(x + w, y, x + w, y + h, rr);
-  ctx.arcTo(x + w, y + h, x, y + h, rr);
-  ctx.arcTo(x, y + h, x, y, rr);
-  ctx.arcTo(x, y, x + w, y, rr);
-  ctx.closePath();
-}
-
-function drawCar(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, color: string, police = false) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.fillStyle = "rgba(0,0,0,.18)";
-  ctx.beginPath();
-  ctx.ellipse(w * 0.5, h * 0.92, w * 0.48, h * 0.12, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = police ? "#172554" : color;
-  roundedRect(ctx, 0, h * 0.28, w, h * 0.52, 12);
-  ctx.fill();
-  ctx.fillStyle = police ? "#f8fafc" : "rgba(255,255,255,.24)";
-  roundedRect(ctx, w * 0.13, h * 0.05, w * 0.57, h * 0.4, 9);
-  ctx.fill();
-  ctx.fillStyle = "#bae6fd";
-  roundedRect(ctx, w * 0.2, h * 0.1, w * 0.2, h * 0.24, 5);
-  ctx.fill();
-  roundedRect(ctx, w * 0.44, h * 0.1, w * 0.2, h * 0.24, 5);
-  ctx.fill();
-  if (police) {
-    ctx.fillStyle = "#f8fafc";
-    ctx.fillRect(w * 0.06, h * 0.5, w * 0.88, h * 0.12);
-    ctx.fillStyle = "#1d4ed8";
-    ctx.font = `700 ${Math.max(7, w * 0.085)}px system-ui`;
-    ctx.fillText("POLICE", w * 0.33, h * 0.6);
-    ctx.fillStyle = "#2563eb";
-    ctx.fillRect(w * 0.43, 0, w * 0.1, h * 0.08);
-    ctx.fillStyle = "#ef4444";
-    ctx.fillRect(w * 0.53, 0, w * 0.1, h * 0.08);
-  }
-  ctx.fillStyle = "#111827";
-  for (const wx of [w * 0.22, w * 0.77]) {
-    ctx.beginPath(); ctx.arc(wx, h * 0.78, h * 0.17, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#94a3b8";
-    ctx.beginPath(); ctx.arc(wx, h * 0.78, h * 0.075, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#111827";
-  }
-  ctx.restore();
-}
-
-function drawPed(ctx: CanvasRenderingContext2D, p: Pedestrian, groundY: number) {
-  const s = p.scale;
-  const y = groundY - 78 * s;
-  const leg = Math.sin(p.phase) * 7 * s;
-  ctx.save();
-  ctx.translate(p.x, y);
-  ctx.lineCap = "round";
-  ctx.strokeStyle = "#334155";
-  ctx.lineWidth = 5 * s;
-  ctx.beginPath();
-  ctx.moveTo(0, 50 * s); ctx.lineTo(-7 * s + leg, 72 * s);
-  ctx.moveTo(0, 50 * s); ctx.lineTo(7 * s - leg, 72 * s);
-  ctx.stroke();
-  ctx.fillStyle = p.shirt;
-  roundedRect(ctx, -13 * s, 24 * s, 26 * s, 34 * s, 7 * s);
-  ctx.fill();
-  ctx.strokeStyle = p.skin;
-  ctx.lineWidth = 4 * s;
-  ctx.beginPath();
-  ctx.moveTo(-10 * s, 31 * s); ctx.lineTo((-21 - (p.wave > 0 ? 8 : 0)) * s, (43 - (p.wave > 0 ? 18 : 0)) * s);
-  ctx.moveTo(10 * s, 31 * s); ctx.lineTo(20 * s, 43 * s);
-  ctx.stroke();
-  ctx.fillStyle = p.skin;
-  ctx.beginPath(); ctx.arc(0, 14 * s, 11 * s, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#3f3f46";
-  ctx.beginPath(); ctx.arc(-1 * s, 9 * s, 11 * s, Math.PI, Math.PI * 2); ctx.fill();
-  ctx.restore();
-}
-
-function drawCity(ctx: CanvasRenderingContext2D, W: number, H: number, distance: number, level: number) {
-  const groundY = H * GROUND;
-  const sky = ctx.createLinearGradient(0, 0, 0, groundY);
-  if (level >= 8) {
-    sky.addColorStop(0, "#172554");
-    sky.addColorStop(0.55, "#7c3aed");
-    sky.addColorStop(1, "#fb7185");
-  } else {
-    sky.addColorStop(0, "#60a5fa");
-    sky.addColorStop(0.55, "#f9a8d4");
-    sky.addColorStop(1, "#fdba74");
-  }
-  ctx.fillStyle = sky;
-  ctx.fillRect(0, 0, W, groundY);
-
-  const sunX = W * 0.78;
-  const sunY = H * 0.16;
-  ctx.fillStyle = level >= 8 ? "rgba(255,255,230,.55)" : "rgba(255,244,190,.88)";
-  ctx.beginPath(); ctx.arc(sunX, sunY, Math.max(24, H * 0.065), 0, Math.PI * 2); ctx.fill();
-
-  const backOffset = -((distance * 0.12) % 170);
-  const buildingColors = ["#f472b6", "#f59e0b", "#38bdf8", "#34d399", "#a78bfa", "#fb7185"];
-  for (let i = -1; i < Math.ceil(W / 170) + 2; i++) {
-    const x = backOffset + i * 170;
-    const seed = Math.abs((i * 37 + Math.floor(distance / 170)) % 7);
-    const bw = 118 + (seed % 3) * 18;
-    const bh = H * (0.2 + (seed % 4) * 0.035);
-    const by = groundY - bh - H * 0.085;
-    ctx.fillStyle = buildingColors[seed % buildingColors.length];
-    ctx.globalAlpha = 0.75;
-    roundedRect(ctx, x, by, bw, bh, 5);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = level >= 8 ? "#fde68a" : "#e0f2fe";
-    for (let wy = by + 20; wy < by + bh - 15; wy += 30) {
-      for (let wx = x + 15; wx < x + bw - 12; wx += 28) {
-        ctx.fillRect(wx, wy, 12, 14);
-      }
-    }
-  }
-
-  ctx.fillStyle = "#e5e7eb";
-  ctx.fillRect(0, groundY - H * 0.085, W, H * 0.085);
-  ctx.fillStyle = "#9ca3af";
-  ctx.fillRect(0, groundY - 6, W, 6);
-  ctx.fillStyle = "#374151";
-  ctx.fillRect(0, groundY, W, H - groundY);
-  ctx.fillStyle = "#facc15";
-  const stripeOffset = -((distance * 0.9) % 120);
-  for (let x = stripeOffset; x < W + 120; x += 120) ctx.fillRect(x, groundY + (H - groundY) * 0.62, 64, 5);
-}
-
-export default function SharkyPizzaRun() {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const runtimeRef = useRef<Runtime>(createRuntime());
-  const audio = useArcadeAudio();
-  const [hud, setHud] = useState(() => ({ score: 0, pizzas: 0, delivered: 0, time: ROUND_DURATION, level: 1, lives: 3, combo: 0, shield: 0, turbo: 0 }));
-  const [started, setStarted] = useState(false);
-  const [paused, setPaused] = useState(false);
-  const [ended, setEnded] = useState<"none" | "lose" | "win">("none");
-  const [muted, setMuted] = useState(false);
-  const [highScore, setHighScore] = useState(() => {
-    try { return Number(localStorage.getItem(HIGH_SCORE_KEY) || 0) || 0; } catch { return 0; }
+    floatTexts: [] as { x: number; y: number; text: string; color: string; life: number }[],
   });
-  const [vito, setVito] = useState<string | null>("Sharky ! Les commandes arrivent. Récupère les pizzas et livre-les sans traîner !");
-  const images = useRef<{ scooter: HTMLImageElement | null; pizza: HTMLImageElement | null }>({ scooter: null, pizza: null });
-  const lastHud = useRef(0);
 
+  const imgsRef = useRef<{ scooter?: HTMLImageElement; pizza?: HTMLImageElement }>({});
   useEffect(() => {
     const s = new Image(); s.src = scooterImg;
     const p = new Image(); p.src = pizzaImg;
-    images.current = { scooter: s, pizza: p };
+    imgsRef.current.scooter = s;
+    imgsRef.current.pizza = p;
   }, []);
 
-  useEffect(() => { audio.setMuted(muted); }, [audio, muted]);
-
-  const speakVito = useCallback((text: string) => {
-    setVito(text);
-    if (muted) return;
-    try {
-      if (!("speechSynthesis" in window)) return;
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "fr-FR";
-      utterance.rate = 1.03;
-      utterance.pitch = 0.88;
-      const voices = window.speechSynthesis.getVoices();
-      const fr = voices.find(v => v.lang.toLowerCase().startsWith("fr"));
-      if (fr) utterance.voice = fr;
-      window.speechSynthesis.speak(utterance);
-    } catch {}
-  }, [muted]);
-
-  const updateHud = useCallback((s: Runtime) => {
-    setHud({
-      score: Math.floor(s.score),
-      pizzas: s.pizzas,
-      delivered: s.delivered,
-      time: Math.max(0, Math.ceil(s.timeLeft)),
-      level: s.level,
-      lives: s.lives,
-      combo: s.combo,
-      shield: s.shield,
-      turbo: s.turbo,
-    });
+  /* High score */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user || cancelled) return;
+      setUserId(user.id);
+      const { data: prog } = await supabase
+        .from("deep_sea_quest_progress")
+        .select("high_score")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (cancelled) return;
+      if (prog) setHighScore(prog.high_score ?? 0);
+      else await supabase.from("deep_sea_quest_progress").insert({ user_id: user.id });
+    })();
+    return () => { cancelled = true; };
   }, []);
 
-  const resetGame = useCallback(() => {
-    runtimeRef.current = createRuntime();
-    setHud({ score: 0, pizzas: 0, delivered: 0, time: ROUND_DURATION, level: 1, lives: 3, combo: 0, shield: 0, turbo: 0 });
-    setStarted(false);
-    setPaused(false);
-    setEnded("none");
-    setVito("Sharky ! Les commandes arrivent. Récupère les pizzas et livre-les sans traîner !");
-  }, []);
+  const persistProgress = useCallback(async (final: number) => {
+    if (!userId) return;
+    const newHigh = Math.max(highScore, final);
+    setHighScore(newHigh);
+    await supabase.from("deep_sea_quest_progress").upsert({
+      user_id: userId,
+      high_score: newHigh,
+    } as any, { onConflict: "user_id" });
+  }, [userId, highScore]);
 
-  const finish = useCallback((s: Runtime, won: boolean) => {
-    s.over = true;
-    s.win = won;
-    const final = Math.floor(s.score);
-    setEnded(won ? "win" : "lose");
-    setPaused(false);
-    if (final > highScore) {
-      setHighScore(final);
-      try { localStorage.setItem(HIGH_SCORE_KEY, String(final)); } catch {}
-    }
-    if (won) speakVito("Bravo Sharky ! Niveau 10 atteint. La ville entière connaît maintenant le meilleur livreur de pizzas !");
-    else speakVito("Pas grave Sharky. Recharge le scooter et repars : la prochaine tournée sera la bonne !");
-  }, [highScore, speakVito]);
-
-  const startJump = useCallback(() => {
-    const s = runtimeRef.current;
-    if (s.over || s.paused) return;
-    if (!s.started) {
-      s.started = true;
-      setStarted(true);
-      speakVito("C'est parti ! Garde jusqu'à cinq pizzas et livre les clients colorés.");
-    }
-    if (s.onGround) {
-      s.vy = JUMP_VY;
-      s.onGround = false;
-      s.jumpHeld = true;
-      s.jumpHold = 0;
-      audio.jump();
-    }
-  }, [audio, speakVito]);
-
-  const stopJump = useCallback(() => { runtimeRef.current.jumpHeld = false; }, []);
-
-  const togglePause = useCallback(() => {
-    const s = runtimeRef.current;
-    if (!s.started || s.over) return;
-    s.paused = !s.paused;
-    setPaused(s.paused);
-  }, []);
-
+  /* Contrôles : tap/hold = saut */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const down = (e: PointerEvent) => { e.preventDefault(); startJump(); };
-    const up = (e: PointerEvent) => { e.preventDefault(); stopJump(); };
-    canvas.addEventListener("pointerdown", down, { passive: false });
-    canvas.addEventListener("pointerup", up, { passive: false });
-    canvas.addEventListener("pointercancel", up, { passive: false });
-    const keydown = (e: KeyboardEvent) => {
-      if (["Space", "ArrowUp", "KeyW"].includes(e.code)) { e.preventDefault(); startJump(); }
-      if (e.code === "KeyP" || e.code === "Escape") togglePause();
+    const onDown = (e: PointerEvent) => {
+      e.preventDefault();
+      const s = stateRef.current;
+      if (!s.started) { s.started = true; setStarted(true); }
+      if (s.gameOver) return;
+      if (s.onGround) {
+        s.sharkVY = JUMP_VY;
+        s.onGround = false;
+        s.jumping = true;
+        s.jumpHold = 0;
+        sounds.jump();
+      }
     };
-    const keyup = (e: KeyboardEvent) => {
-      if (["Space", "ArrowUp", "KeyW"].includes(e.code)) stopJump();
-    };
-    window.addEventListener("keydown", keydown);
-    window.addEventListener("keyup", keyup);
+    const onUp = () => { stateRef.current.jumping = false; };
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+    canvas.addEventListener("pointerleave", onUp);
     return () => {
-      canvas.removeEventListener("pointerdown", down);
-      canvas.removeEventListener("pointerup", up);
-      canvas.removeEventListener("pointercancel", up);
-      window.removeEventListener("keydown", keydown);
-      window.removeEventListener("keyup", keyup);
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("pointercancel", onUp);
+      canvas.removeEventListener("pointerleave", onUp);
     };
-  }, [startJump, stopJump, togglePause]);
+  }, [sounds]);
 
+  /* Boucle */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    let raf = 0;
-    let previous = performance.now();
 
     const resize = () => {
-      const rect = canvas.getBoundingClientRect();
       const dpr = Math.min(1.5, window.devicePixelRatio || 1);
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const s = runtimeRef.current;
-      s.sharkX = Math.max(90, rect.width * 0.2);
-      if (s.onGround || s.sharkY === 0) s.sharkY = rect.height * GROUND;
-      if (s.pedestrians.length === 0) {
-        for (let i = 0; i < 9; i++) {
-          s.pedestrians.push({
-            x: Math.random() * rect.width * 1.4,
-            phase: Math.random() * Math.PI * 2,
-            speed: 0.22 + Math.random() * 0.14,
-            shirt: COLORS[i % COLORS.length],
-            skin: ["#f5d0a9", "#d6a77a", "#8d5d42"][i % 3],
-            scale: 0.72 + Math.random() * 0.2,
-            wave: 0,
+      const s = stateRef.current;
+      s.sharkX = rect.width * 0.22;
+      const groundY = rect.height * GROUND_RATIO;
+      if (s.onGround) s.sharkY = groundY;
+      // Init clouds + buildings
+      if (s.clouds.length === 0) {
+        for (let i = 0; i < 5; i++) {
+          s.clouds.push({
+            x: Math.random() * rect.width,
+            y: 30 + Math.random() * (rect.height * 0.35),
+            scale: 0.5 + Math.random() * 1,
+            speed: 8 + Math.random() * 12,
           });
         }
       }
-      if (s.traffic.length === 0) {
-        for (let i = 0; i < 6; i++) {
-          s.traffic.push({
-            x: Math.random() * rect.width * 1.5,
-            lane: (i % 2) as 0 | 1,
-            dir: i % 3 === 0 ? -1 : 1,
-            speed: 0.38 + Math.random() * 0.35,
-            color: COLORS[(i + 2) % COLORS.length],
-            type: (["sedan", "van", "mini"] as const)[i % 3],
-          });
+      if (s.buildings.length === 0) {
+        let x = 0;
+        const bgColors = [
+          ["#f9a8d4", "#fce7f3"], // rose
+          ["#fde047", "#fef9c3"], // jaune
+          ["#7dd3fc", "#e0f2fe"], // bleu
+          ["#86efac", "#dcfce7"], // vert
+          ["#c4b5fd", "#ede9fe"], // violet
+          ["#fdba74", "#ffedd5"], // orange
+        ];
+        while (x < rect.width * 1.5) {
+          const w = 60 + Math.random() * 100;
+          const h = 100 + Math.random() * 220;
+          const c = bgColors[Math.floor(Math.random() * bgColors.length)];
+          s.buildings.push({ x, w, h, color: c[0], windowsCol: c[1] });
+          x += w + 4;
         }
       }
     };
     resize();
     window.addEventListener("resize", resize);
 
-    const spawn = (s: Runtime, W: number, H: number) => {
-      const gy = H * GROUND;
+    let raf = 0;
+    let last = performance.now();
+
+    const spawnObstacle = (W: number, H: number, _depth: number) => {
+      const s = stateRef.current;
+      const groundY = H * GROUND_RATIO;
       const r = Math.random();
-      let kind: Kind;
-      if (r < 0.31) kind = "pizza";
-      else if (r < 0.47) kind = "cone";
-      else if (r < 0.59) kind = "puddle";
-      else if (r < 0.7) kind = "trash";
-      else if (r < 0.84) kind = "car";
-      else if (r < 0.91) kind = "barrier";
-      else if (r < 0.96 && s.level >= 4) kind = "turbo";
-      else if (s.level >= 5) kind = "shield";
-      else kind = "pizza";
-      const dims: Record<Kind, [number, number]> = {
-        pizza: [36, 36], customer: [72, 86], cone: [28, 36], puddle: [76, 15], trash: [38, 48], car: [112, 54], barrier: [72, 44], rival: [98, 58], roadblock: [135, 58], turbo: [38, 38], shield: [40, 40],
-      };
-      const [w, h] = dims[kind];
-      let y = gy - h;
-      if (kind === "pizza" && Math.random() < 0.52) y -= 55 + Math.random() * 55;
-      if (kind === "turbo" || kind === "shield") y -= 52;
-      s.entities.push({ x: W + 60, y, w, h, kind, alive: true, phase: 0, color: COLORS[Math.floor(Math.random() * COLORS.length)] });
+      let kind: ObstacleKind;
+      if (r < 0.4) kind = "cone";
+      else if (r < 0.65) kind = "puddle";
+      else if (r < 0.85) kind = "trash";
+      else kind = "car";
+      const dims =
+        kind === "cone" ? { w: 28, h: 36 } :
+        kind === "puddle" ? { w: 70, h: 14 } :
+        kind === "trash" ? { w: 36, h: 46 } :
+        { w: 110, h: 50 }; // car
+      s.entities.push({
+        x: W + 60,
+        y: groundY - dims.h,
+        w: dims.w, h: dims.h,
+        kind, alive: true, phase: 0,
+      });
     };
 
-    const spawnCustomer = (s: Runtime, W: number, H: number) => {
-      s.entities.push({ x: W + 70, y: H * GROUND - 86, w: 72, h: 86, kind: "customer", alive: true, phase: 0, color: COLORS[Math.floor(Math.random() * COLORS.length)] });
+    const spawnPizza = (W: number, H: number) => {
+      const s = stateRef.current;
+      const groundY = H * GROUND_RATIO;
+      const inAir = Math.random() < 0.45;
+      const w = 32, h = 32;
+      const y = inAir ? groundY - 80 - Math.random() * 50 : groundY - h - 4;
+      s.entities.push({
+        x: W + 40, y, w, h,
+        kind: "pizza", alive: true, phase: 0,
+        lane: inAir ? 1 : 0,
+      });
     };
 
-    const spawnRival = (s: Runtime, W: number, H: number) => {
-      s.entities.push({ x: W + 100, y: H * GROUND - 58, w: 98, h: 58, kind: "rival", alive: true, phase: 0, color: COLORS[Math.floor(Math.random() * COLORS.length)], vx: 40 + s.level * 8 });
+    const spawnCustomer = (W: number, H: number) => {
+      const s = stateRef.current;
+      const groundY = H * GROUND_RATIO;
+      const w = 70, h = 80;
+      const color = CUSTOMER_COLORS[Math.floor(Math.random() * CUSTOMER_COLORS.length)];
+      s.entities.push({
+        x: W + 60, y: groundY - h, w, h,
+        kind: "customer", alive: true, phase: 0,
+        customerColor: color,
+      });
     };
 
-    const spawnRoadblock = (s: Runtime, W: number, H: number) => {
-      s.entities.push({ x: W + 100, y: H * GROUND - 58, w: 135, h: 58, kind: "roadblock", alive: true, phase: 0, color: "#1d4ed8" });
-      audio.siren();
-    };
+    const tick = (now: number) => {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
 
-    const damage = (s: Runtime, e: Entity) => {
-      if (s.invuln > 0) return;
-      e.alive = false;
-      if (s.shield > 0) {
-        s.shield = 0;
-        s.invuln = 1;
-        s.floatTexts.push({ x: s.sharkX, y: s.sharkY - 90, text: "BOUCLIER !", color: "#67e8f9", life: 1 });
-        audio.power();
+      const s = stateRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const W = rect.width, H = rect.height;
+      const groundY = H * GROUND_RATIO;
+
+      /* ===== FOND : ciel dégradé ===== */
+      const sky = ctx.createLinearGradient(0, 0, 0, groundY);
+      sky.addColorStop(0, "#fde68a");
+      sky.addColorStop(0.5, "#fdba74");
+      sky.addColorStop(1, "#fb923c");
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, W, groundY);
+
+      // Soleil
+      ctx.fillStyle = "rgba(255,240,180,0.85)";
+      ctx.beginPath(); ctx.arc(W * 0.78, H * 0.18, 42, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "rgba(255,250,220,0.4)";
+      ctx.beginPath(); ctx.arc(W * 0.78, H * 0.18, 60, 0, Math.PI * 2); ctx.fill();
+
+      /* ===== Nuages ===== */
+      for (const c of s.clouds) {
+        if (s.started && !s.gameOver) c.x -= c.speed * dt;
+        if (c.x < -80) c.x = W + 60;
+        drawCloud(ctx, c.x, c.y, c.scale);
+      }
+
+      /* ===== Buildings (parallaxe lente) ===== */
+      const bgSpeed = s.started && !s.gameOver ? s.speed * 0.35 : 0;
+      for (const b of s.buildings) b.x -= bgSpeed * dt;
+      // recycle
+      let maxX = 0;
+      for (const b of s.buildings) maxX = Math.max(maxX, b.x + b.w);
+      while (maxX < W + 200) {
+        const bgColors = [
+          ["#f9a8d4", "#fce7f3"], ["#fde047", "#fef9c3"],
+          ["#7dd3fc", "#e0f2fe"], ["#86efac", "#dcfce7"],
+          ["#c4b5fd", "#ede9fe"], ["#fdba74", "#ffedd5"],
+        ];
+        const w = 60 + Math.random() * 100;
+        const h = 100 + Math.random() * 220;
+        const c = bgColors[Math.floor(Math.random() * bgColors.length)];
+        s.buildings.push({ x: maxX + 4, w, h, color: c[0], windowsCol: c[1] });
+        maxX += w + 4;
+      }
+      s.buildings = s.buildings.filter(b => b.x + b.w > -10);
+      for (const b of s.buildings) drawBuilding(ctx, b, groundY);
+
+      /* ===== Trottoir ===== */
+      // Bord de trottoir
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillRect(0, groundY - 6, W, 6);
+      ctx.fillStyle = "#cbd5e1";
+      ctx.fillRect(0, groundY - 8, W, 2);
+      // Route
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(0, groundY, W, H - groundY);
+      // Lignes de route défilantes
+      ctx.fillStyle = "#fbbf24";
+      const dashY = groundY + (H - groundY) * 0.55;
+      const dashW = 40, dashGap = 30;
+      const offset = (s.distance * 0.6) % (dashW + dashGap);
+      for (let x = -offset; x < W; x += dashW + dashGap) {
+        ctx.fillRect(x, dashY, dashW, 5);
+      }
+      // Ombres sol
+      ctx.fillStyle = "rgba(0,0,0,0.15)";
+      ctx.fillRect(0, groundY, W, 8);
+
+      /* Écran d'attente */
+      if (!s.started) {
+        drawShark(ctx, s.sharkX, groundY + Math.sin(now / 300) * 2);
+        ctx.save();
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(0, H * 0.32, W, 90);
+        ctx.fillStyle = "#fff";
+        ctx.textAlign = "center";
+        ctx.font = "bold 22px system-ui, sans-serif";
+        ctx.fillText("🍕 Tap pour démarrer", W / 2, H * 0.32 + 35);
+        ctx.font = "13px system-ui, sans-serif";
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.fillText("Tap = saut · Maintien = saut + haut", W / 2, H * 0.32 + 60);
+        ctx.fillText("Récupère les pizzas, livre aux clients !", W / 2, H * 0.32 + 78);
+        ctx.restore();
+        raf = requestAnimationFrame(tick);
         return;
       }
-      s.lives -= 1;
-      s.combo = 0;
-      s.invuln = 1.25;
-      s.shake = 0.4;
-      s.floatTexts.push({ x: s.sharkX, y: s.sharkY - 90, text: "AÏE !", color: "#fecaca", life: 0.9 });
-      audio.crash();
-      if (s.lives <= 0) finish(s, false);
-    };
 
-    const vitoForLevel = (level: number) => {
-      if (level === 3) speakVito("Niveau 3 ! Des concurrents arrivent. Reste concentré sur tes livraisons !");
-      if (level === 5) speakVito("Niveau 5 ! La circulation se resserre et les patrouilles apparaissent. Garde ton rythme !");
-      if (level === 8) speakVito("Niveau 8 ! Attention aux barrages sur la route. Saute au bon moment !");
-      if (level === 10) speakVito("Niveau 10 ! Dernière ligne droite, Sharky !");
-    };
+      if (s.gameOver) {
+        // Continue d'afficher le décor mais figé
+        drawShark(ctx, s.sharkX, s.sharkY);
+        for (const e of s.entities) drawEntity(ctx, e);
+        raf = requestAnimationFrame(tick);
+        return;
+      }
 
-    const frame = (now: number) => {
-      const dt = Math.min(0.033, Math.max(0, (now - previous) / 1000));
-      previous = now;
-      const rect = canvas.getBoundingClientRect();
-      const W = rect.width;
-      const H = rect.height;
-      const gy = H * GROUND;
-      const s = runtimeRef.current;
+      /* ===== Update gameplay ===== */
+      // Timer
+      s.timeLeft = Math.max(0, s.timeLeft - dt);
+      if (s.timeLeft <= 0) {
+        endGame(s.score);
+      }
 
-      if (s.sharkY === 0) s.sharkY = gy;
+      // Vitesse qui augmente doucement
+      s.speed = Math.min(520, s.speed + dt * 8);
+      s.distance += s.speed * dt;
 
-      if (s.started && !s.paused && !s.over) {
-        s.timeLeft -= dt;
-        if (s.timeLeft <= 0) finish(s, false);
-        s.level = levelFromDeliveries(s.delivered);
-        const levelIndex = clamp(s.level - 1, 0, SPEED_STEPS.length - 1);
-        const baseSpeed = SPEED_STEPS[levelIndex];
-        if (s.turbo > 0) s.turbo = Math.max(0, s.turbo - dt);
-        if (s.shield > 0) s.shield = Math.max(0, s.shield - dt);
-        s.speed += (baseSpeed * (s.turbo > 0 ? 1.18 : 1) - s.speed) * Math.min(1, dt * 2.5);
-        s.distance += s.speed * dt;
-        s.score += dt * (8 + s.level * 2) * (1 + s.combo * 0.04);
-        s.invuln = Math.max(0, s.invuln - dt);
-        s.shake = Math.max(0, s.shake - dt);
+      // Saut
+      if (s.jumping && !s.onGround && s.jumpHold < JUMP_HOLD_MAX) {
+        s.sharkVY += JUMP_HOLD_BOOST * dt * 60;
+        s.jumpHold += dt;
+      }
+      s.sharkVY += GRAVITY * dt;
+      s.sharkY += s.sharkVY * dt;
+      if (s.sharkY >= groundY) {
+        s.sharkY = groundY;
+        s.sharkVY = 0;
+        s.onGround = true;
+      }
 
-        if (!s.onGround) {
-          if (s.jumpHeld && s.jumpHold < 0.18) {
-            s.vy -= 72 * dt * 60;
-            s.jumpHold += dt;
-          }
-          s.vy += GRAVITY * dt;
-          s.sharkY += s.vy * dt;
-          if (s.sharkY >= gy) {
-            s.sharkY = gy;
-            s.vy = 0;
-            s.onGround = true;
-          }
-        }
+      // Spawn obstacles & pizzas
+      s.spawnTimer -= dt;
+      if (s.spawnTimer <= 0) {
+        // Mix : alterne obstacle / pizza
+        const r = Math.random();
+        if (r < 0.55) spawnObstacle(W, H, s.distance);
+        else spawnPizza(W, H);
+        // intervalle plus court avec la vitesse
+        const base = 1.4 - Math.min(0.7, s.speed / 1500);
+        s.spawnTimer = base + Math.random() * 0.6;
+      }
+      // Spawn clients périodiques
+      s.customerTimer -= dt;
+      if (s.customerTimer <= 0) {
+        spawnCustomer(W, H);
+        s.customerTimer = 9 + Math.random() * 6;
+      }
 
-        if (s.lastVitoLevel !== s.level) {
-          s.lastVitoLevel = s.level;
-          vitoForLevel(s.level);
-        }
+      // Update entities
+      for (const e of s.entities) {
+        if (!e.alive) continue;
+        e.x -= s.speed * dt;
+        e.phase += dt * 4;
+      }
+      s.entities = s.entities.filter(e => e.alive && e.x + e.w > -50);
 
-        s.spawnTimer -= dt;
-        if (s.spawnTimer <= 0) {
-          spawn(s, W, H);
-          const floor = SPAWN_FLOORS[levelIndex];
-          s.spawnTimer = floor + Math.random() * (0.45 + floor * 0.35);
-        }
-        s.customerTimer -= dt;
-        if (s.customerTimer <= 0) {
-          spawnCustomer(s, W, H);
-          s.customerTimer = Math.max(2.15, 3.2 - s.level * 0.08) + Math.random() * 0.65;
-        }
-        if (s.level >= 3) {
-          s.rivalTimer -= dt;
-          if (s.rivalTimer <= 0) {
-            spawnRival(s, W, H);
-            s.rivalTimer = Math.max(4.4, 8 - s.level * 0.32) + Math.random() * 2;
-          }
-        }
-        if (s.level >= 8) {
-          s.roadblockTimer -= dt;
-          if (s.roadblockTimer <= 0) {
-            spawnRoadblock(s, W, H);
-            s.roadblockTimer = 7 + Math.random() * 3;
-          }
-        }
+      // Hitbox du requin (légèrement réduite pour fairness)
+      const sharkBox = {
+        x: s.sharkX - 38, y: s.sharkY - 56,
+        w: 76, h: 56,
+      };
 
-        const player = { x: s.sharkX - 35, y: s.sharkY - 70, w: 88, h: 68 };
-        for (const e of s.entities) {
-          if (!e.alive) continue;
-          e.phase += dt;
-          const factor = e.kind === "rival" ? 0.72 : 1;
-          e.x -= Math.max(120, s.speed * factor - (e.vx || 0)) * dt;
-          if (e.x < -220) { e.alive = false; continue; }
-          if (!overlap(player, e)) continue;
+      // Collisions
+      for (const e of s.entities) {
+        if (!e.alive) continue;
+        const overlap = sharkBox.x < e.x + e.w &&
+                        sharkBox.x + sharkBox.w > e.x &&
+                        sharkBox.y < e.y + e.h &&
+                        sharkBox.y + sharkBox.h > e.y;
+        if (!overlap) continue;
 
-          if (e.kind === "pizza") {
+        if (e.kind === "pizza") {
+          if (s.pizzas < MAX_PIZZAS) {
             e.alive = false;
-            if (s.pizzas < MAX_PIZZAS) {
-              s.pizzas += 1;
-              s.score += 90 * (1 + s.level * 0.1);
-              s.floatTexts.push({ x: e.x, y: e.y, text: "+ PIZZA", color: "#fde047", life: 0.9 });
-              audio.pickup();
-            } else {
-              s.score += 25;
-              s.floatTexts.push({ x: e.x, y: e.y, text: "STOCK PLEIN", color: "#fef3c7", life: 0.8 });
-            }
-          } else if (e.kind === "customer") {
+            s.pizzas += 1;
+            s.score += 10;
+            sounds.pickup();
+            s.floatTexts.push({ x: e.x, y: e.y, text: "+1 🍕", color: "#fbbf24", life: 1 });
+          }
+        } else if (e.kind === "customer") {
+          if (s.pizzas > 0) {
             e.alive = false;
+            const delivered = Math.min(s.pizzas, 1); // une livraison à la fois
+            s.pizzas -= delivered;
+            s.delivered += delivered;
+            s.combo += 1;
+            const baseScore = 100 * delivered;
+            const comboBonus = Math.min(150, s.combo * 15);
+            const total = baseScore + comboBonus;
+            s.score += total;
+            s.timeLeft = Math.min(ROUND_DURATION, s.timeLeft + 4); // +4s par livraison !
+            sounds.deliver();
+            s.flash = 0.3;
+            s.flashColor = "rgba(34,197,94,0.35)";
+            s.floatTexts.push({
+              x: e.x, y: e.y - 10,
+              text: `+${total} ${s.combo > 1 ? `x${s.combo}` : ""} +4s`,
+              color: "#22c55e", life: 1.4,
+            });
+          } else {
+            // pas de pizza : client déçu mais pas de pénalité, on rate juste
+          }
+        } else {
+          // obstacle
+          if (s.invuln <= 0) {
+            sounds.crash();
+            if (e.kind === "car") sounds.horn();
+            s.shake = 16;
+            s.invuln = 1.2;
+            s.combo = 0;
+            s.flash = 0.4;
+            s.flashColor = "rgba(239,68,68,0.4)";
+            // pénalité : -8s + perdre une pizza
+            s.timeLeft = Math.max(0, s.timeLeft - 8);
             if (s.pizzas > 0) {
               s.pizzas -= 1;
-              s.delivered += 1;
-              s.combo += 1;
-              s.score += 450 * (1 + (s.level - 1) * 0.5) * (1 + Math.min(8, s.combo) * 0.05);
-              s.floatTexts.push({ x: e.x, y: e.y, text: `LIVRÉ x${s.combo}`, color: "#86efac", life: 1.1 });
-              audio.deliver();
-              const newLevel = levelFromDeliveries(s.delivered);
-              if (newLevel >= WIN_LEVEL) finish(s, true);
+              s.floatTexts.push({ x: s.sharkX, y: s.sharkY - 60, text: "-1 🍕 -8s", color: "#ef4444", life: 1.4 });
             } else {
-              s.combo = 0;
-              s.floatTexts.push({ x: e.x, y: e.y, text: "PAS DE PIZZA", color: "#fca5a5", life: 0.9 });
+              s.floatTexts.push({ x: s.sharkX, y: s.sharkY - 60, text: "-8s", color: "#ef4444", life: 1.4 });
             }
-          } else if (e.kind === "turbo") {
-            e.alive = false;
-            s.turbo = 5;
-            s.score += 150;
-            s.floatTexts.push({ x: e.x, y: e.y, text: "TURBO 5s", color: "#fbbf24", life: 1 });
-            audio.power();
-          } else if (e.kind === "shield") {
-            e.alive = false;
-            s.shield = 8;
-            s.score += 150;
-            s.floatTexts.push({ x: e.x, y: e.y, text: "BOUCLIER 8s", color: "#67e8f9", life: 1 });
-            audio.power();
-          } else if (e.kind === "rival") {
-            e.alive = false;
-            s.score += 120;
-            s.floatTexts.push({ x: e.x, y: e.y, text: "DÉPASSÉ !", color: "#c4b5fd", life: 0.9 });
-          } else {
-            damage(s, e);
+            // léger rebond
+            if (s.onGround) { s.sharkVY = -300; s.onGround = false; }
+            if (s.timeLeft <= 0) endGame(s.score);
           }
         }
-        s.entities = s.entities.filter(e => e.alive);
-
-        for (const p of s.pedestrians) {
-          p.x -= s.speed * p.speed * dt;
-          p.phase += dt * 7;
-          p.wave = Math.max(0, p.wave - dt);
-          if (Math.abs(p.x - s.sharkX) < 130 && p.wave <= 0) p.wave = 0.8;
-          if (p.x < -60) p.x = W + 80 + Math.random() * W;
-        }
-        for (const c of s.traffic) {
-          const motion = c.dir === 1 ? -s.speed * c.speed : -s.speed * (1.05 + c.speed);
-          c.x += motion * dt;
-          if (c.x < -180) c.x = W + 100 + Math.random() * W;
-        }
-        for (const f of s.floatTexts) {
-          f.y -= 35 * dt;
-          f.life -= dt;
-        }
-        s.floatTexts = s.floatTexts.filter(f => f.life > 0);
       }
 
-      const shakeX = s.shake > 0 ? (Math.random() - 0.5) * 10 : 0;
-      const shakeY = s.shake > 0 ? (Math.random() - 0.5) * 7 : 0;
+      if (s.invuln > 0) s.invuln -= dt;
+
+      // Float texts
+      for (const ft of s.floatTexts) {
+        ft.y -= 30 * dt;
+        ft.life -= dt;
+      }
+      s.floatTexts = s.floatTexts.filter(ft => ft.life > 0);
+
+      /* ===== DESSIN ===== */
+      // Tremblement
+      let sx = 0, sy = 0;
+      if (s.shake > 0) {
+        sx = (Math.random() - 0.5) * s.shake;
+        sy = (Math.random() - 0.5) * s.shake;
+        s.shake = Math.max(0, s.shake - dt * 35);
+      }
       ctx.save();
-      ctx.translate(shakeX, shakeY);
-      drawCity(ctx, W, H, s.distance, s.level);
+      ctx.translate(sx, sy);
 
-      for (const p of s.pedestrians) drawPed(ctx, p, gy - 7);
-      for (const c of s.traffic) {
-        const y = gy + (c.lane === 0 ? 18 : 62);
-        const scale = c.lane === 0 ? 0.62 : 0.78;
-        drawCar(ctx, c.x, y, 105 * scale, 55 * scale, c.color);
-      }
-
-      if (s.level >= 5 && s.started && !s.over) {
-        const policeCount = s.level >= 8 ? 2 : 1;
-        for (let i = 0; i < policeCount; i++) {
-          const px = 12 + i * 118 + Math.sin(now / 650 + i) * 7;
-          const py = gy + 43 + i * 8;
-          drawCar(ctx, px, py, 105, 52, "#1e3a8a", true);
-          if (Math.floor(now / 180) % 2 === 0) {
-            ctx.fillStyle = i % 2 ? "rgba(239,68,68,.28)" : "rgba(37,99,235,.28)";
-            ctx.beginPath(); ctx.arc(px + 57, py - 3, 34, 0, Math.PI * 2); ctx.fill();
-          }
-        }
-      }
-
+      // Entities (clients d'abord pour qu'ils soient derrière les obstacles ?
+      // En fait on dessine dans l'ordre du sol)
       for (const e of s.entities) {
+        if (!e.alive) continue;
+        drawEntity(ctx, e);
+      }
+
+      // Ombre du requin au sol
+      const heightAbove = groundY - s.sharkY;
+      const shadowScale = 1 - Math.min(0.6, heightAbove / 200);
+      ctx.fillStyle = `rgba(0,0,0,${0.25 * shadowScale})`;
+      ctx.beginPath();
+      ctx.ellipse(s.sharkX, groundY - 2, 40 * shadowScale, 6 * shadowScale, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Sharky (clignote en invuln)
+      const blink = s.invuln > 0 && Math.floor(s.invuln * 12) % 2 === 0;
+      if (!blink) drawShark(ctx, s.sharkX, s.sharkY);
+
+      // Indicateur pizzas en stock au-dessus du requin
+      drawPizzaStack(ctx, s.sharkX + 32, s.sharkY - 70, s.pizzas);
+
+      // Float texts
+      for (const ft of s.floatTexts) {
         ctx.save();
-        if (e.kind === "pizza") {
-          const img = images.current.pizza;
-          if (img?.complete && img.naturalWidth) ctx.drawImage(img, e.x, e.y, e.w, e.h);
-          else { ctx.font = `${e.w}px sans-serif`; ctx.fillText("🍕", e.x, e.y + e.h); }
-        } else if (e.kind === "customer") {
-          const pulse = 1 + Math.sin(now / 180 + e.phase) * 0.05;
-          ctx.translate(e.x + e.w / 2, e.y + e.h / 2);
-          ctx.scale(pulse, pulse);
-          ctx.translate(-e.w / 2, -e.h / 2);
-          ctx.strokeStyle = e.color || "#22c55e";
-          ctx.lineWidth = 4;
-          ctx.setLineDash([8, 6]);
-          roundedRect(ctx, 0, 0, e.w, e.h, 14); ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.fillStyle = "rgba(255,255,255,.92)";
-          roundedRect(ctx, 9, 10, e.w - 18, e.h - 18, 12); ctx.fill();
-          ctx.font = "34px sans-serif"; ctx.fillText("🙋", 18, 49);
-          ctx.font = "bold 14px system-ui"; ctx.fillStyle = "#111827"; ctx.fillText("PIZZA", 13, 72);
-        } else if (e.kind === "cone") {
-          ctx.fillStyle = "#f97316";
-          ctx.beginPath(); ctx.moveTo(e.x + e.w / 2, e.y); ctx.lineTo(e.x + e.w, e.y + e.h); ctx.lineTo(e.x, e.y + e.h); ctx.closePath(); ctx.fill();
-          ctx.fillStyle = "#fff7ed"; ctx.fillRect(e.x + 5, e.y + e.h * 0.55, e.w - 10, 6);
-        } else if (e.kind === "puddle") {
-          ctx.fillStyle = "rgba(56,189,248,.65)";
-          ctx.beginPath(); ctx.ellipse(e.x + e.w / 2, e.y + e.h / 2, e.w / 2, e.h / 2, 0, 0, Math.PI * 2); ctx.fill();
-        } else if (e.kind === "trash") {
-          ctx.fillStyle = "#475569"; roundedRect(ctx, e.x, e.y + 6, e.w, e.h - 6, 5); ctx.fill();
-          ctx.fillStyle = "#64748b"; ctx.fillRect(e.x - 3, e.y + 4, e.w + 6, 7);
-        } else if (e.kind === "car") {
-          drawCar(ctx, e.x, e.y, e.w, e.h, e.color || "#ef4444");
-        } else if (e.kind === "barrier") {
-          ctx.fillStyle = "#f8fafc"; roundedRect(ctx, e.x, e.y + 14, e.w, 18, 4); ctx.fill();
-          ctx.fillStyle = "#ef4444";
-          for (let x = 4; x < e.w - 4; x += 22) ctx.fillRect(e.x + x, e.y + 14, 11, 18);
-          ctx.fillStyle = "#475569"; ctx.fillRect(e.x + 9, e.y + 31, 7, 13); ctx.fillRect(e.x + e.w - 16, e.y + 31, 7, 13);
-        } else if (e.kind === "rival") {
-          ctx.fillStyle = e.color || "#8b5cf6";
-          roundedRect(ctx, e.x + 20, e.y + 15, e.w - 20, e.h - 22, 13); ctx.fill();
-          ctx.fillStyle = "#111827";
-          ctx.beginPath(); ctx.arc(e.x + 35, e.y + e.h - 5, 11, 0, Math.PI * 2); ctx.arc(e.x + e.w - 18, e.y + e.h - 5, 11, 0, Math.PI * 2); ctx.fill();
-          ctx.font = "28px sans-serif"; ctx.fillText("😼", e.x + 2, e.y + 29);
-          ctx.font = "18px sans-serif"; ctx.fillText("🍕", e.x + 54, e.y + 23);
-        } else if (e.kind === "roadblock") {
-          ctx.fillStyle = "#1e3a8a"; roundedRect(ctx, e.x, e.y + 12, e.w, 26, 6); ctx.fill();
-          ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px system-ui"; ctx.fillText("POLICE", e.x + 43, e.y + 30);
-          ctx.fillStyle = "#fde047";
-          for (let x = 6; x < e.w - 6; x += 30) ctx.fillRect(e.x + x, e.y + 38, 18, 7);
-          ctx.fillStyle = "#334155"; ctx.fillRect(e.x + 15, e.y + 44, 8, 14); ctx.fillRect(e.x + e.w - 23, e.y + 44, 8, 14);
-        } else if (e.kind === "turbo") {
-          ctx.fillStyle = "rgba(251,191,36,.25)"; ctx.beginPath(); ctx.arc(e.x + 19, e.y + 19, 26, 0, Math.PI * 2); ctx.fill();
-          ctx.font = "34px sans-serif"; ctx.fillText("⚡", e.x + 2, e.y + 33);
-        } else if (e.kind === "shield") {
-          ctx.fillStyle = "rgba(34,211,238,.25)"; ctx.beginPath(); ctx.arc(e.x + 20, e.y + 20, 27, 0, Math.PI * 2); ctx.fill();
-          ctx.font = "33px sans-serif"; ctx.fillText("🛡️", e.x + 1, e.y + 34);
-        }
+        const a = Math.min(1, ft.life);
+        ctx.globalAlpha = a;
+        ctx.font = "bold 16px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = "rgba(0,0,0,0.6)";
+        ctx.strokeText(ft.text, ft.x, ft.y);
+        ctx.fillStyle = ft.color;
+        ctx.fillText(ft.text, ft.x, ft.y);
         ctx.restore();
       }
 
-      ctx.save();
-      const flash = s.invuln > 0 && Math.floor(now / 90) % 2 === 0;
-      ctx.globalAlpha = flash ? 0.35 : 1;
-      if (s.shield > 0) {
-        ctx.strokeStyle = "#67e8f9";
-        ctx.lineWidth = 4;
-        ctx.fillStyle = "rgba(34,211,238,.12)";
-        ctx.beginPath(); ctx.arc(s.sharkX + 10, s.sharkY - 36, 57, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-      }
-      if (s.turbo > 0) {
-        ctx.strokeStyle = "#fbbf24";
-        ctx.lineWidth = 5;
-        for (let i = 0; i < 4; i++) {
-          ctx.beginPath(); ctx.moveTo(s.sharkX - 65 - i * 14, s.sharkY - 25 + i * 8); ctx.lineTo(s.sharkX - 20, s.sharkY - 25 + i * 8); ctx.stroke();
-        }
-      }
-      const img = images.current.scooter;
-      if (img?.complete && img.naturalWidth) {
-        const ratio = img.naturalWidth / Math.max(1, img.naturalHeight);
-        const h = 105;
-        const w = clamp(h * ratio, 118, 175);
-        ctx.drawImage(img, s.sharkX - w * 0.35, s.sharkY - h + 9, w, h);
-      } else {
-        ctx.font = "62px sans-serif"; ctx.fillText("🛵", s.sharkX - 30, s.sharkY);
-      }
       ctx.restore();
 
-      for (const f of s.floatTexts) {
-        ctx.globalAlpha = clamp(f.life, 0, 1);
-        ctx.fillStyle = f.color;
-        ctx.font = "900 17px system-ui";
-        ctx.textAlign = "center";
-        ctx.fillText(f.text, f.x, f.y);
+      // Flash overlay
+      if (s.flash > 0) {
+        ctx.fillStyle = s.flashColor;
+        ctx.fillRect(0, 0, W, H);
+        s.flash = Math.max(0, s.flash - dt * 2);
       }
-      ctx.globalAlpha = 1;
-      ctx.textAlign = "start";
-      ctx.restore();
 
-      if (s.started && !s.paused && !s.over && now - lastHud.current > 90) {
-        lastHud.current = now;
-        updateHud(s);
+      // Sync UI
+      if (Math.floor(now / 100) % 2 === 0) {
+        setScore(s.score);
+        setPizzas(s.pizzas);
+        setDelivered(s.delivered);
+        setTimeLeft(Math.ceil(s.timeLeft));
+        setCombo(s.combo);
       }
-      raf = requestAnimationFrame(frame);
+
+      raf = requestAnimationFrame(tick);
     };
 
-    raf = requestAnimationFrame(frame);
+    const endGame = (final: number) => {
+      const s = stateRef.current;
+      if (s.gameOver) return;
+      s.gameOver = true;
+      setGameOver(true);
+      setScore(final);
+      persistProgress(final);
+    };
+
+    raf = requestAnimationFrame(tick);
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
     };
-  }, [audio, finish, speakVito, updateHud]);
+  }, [persistProgress, sounds]);
+
+  /* ===== Helpers de dessin ===== */
+  function drawCloud(ctx: CanvasRenderingContext2D, x: number, y: number, scale: number) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.beginPath();
+    ctx.arc(0, 0, 18, 0, Math.PI * 2);
+    ctx.arc(20, -4, 22, 0, Math.PI * 2);
+    ctx.arc(40, 0, 18, 0, Math.PI * 2);
+    ctx.arc(20, 8, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBuilding(ctx: CanvasRenderingContext2D, b: Building, groundY: number) {
+    const top = groundY - 10 - b.h;
+    ctx.fillStyle = b.color;
+    ctx.fillRect(b.x, top, b.w, b.h);
+    // toit
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.fillRect(b.x - 2, top - 4, b.w + 4, 4);
+    // fenêtres
+    const wcols = Math.max(2, Math.floor(b.w / 18));
+    const wrows = Math.max(2, Math.floor(b.h / 24));
+    const gx = (b.w - wcols * 10) / (wcols + 1);
+    const gy = (b.h - wrows * 12) / (wrows + 1);
+    for (let i = 0; i < wcols; i++) {
+      for (let j = 0; j < wrows; j++) {
+        const wx = b.x + gx + i * (10 + gx);
+        const wy = top + gy + j * (12 + gy);
+        ctx.fillStyle = (i + j) % 3 === 0 ? "#fde68a" : b.windowsCol;
+        ctx.fillRect(wx, wy, 10, 12);
+        ctx.strokeStyle = "rgba(0,0,0,0.15)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(wx, wy, 10, 12);
+      }
+    }
+  }
+
+  function drawShark(ctx: CanvasRenderingContext2D, x: number, y: number) {
+    const img = imgsRef.current.scooter;
+    const w = 130, h = 100;
+    if (img && img.complete && img.naturalWidth > 0) {
+      // léger tilt si en l'air
+      const s = stateRef.current;
+      const tilt = !s.onGround ? Math.max(-0.18, Math.min(0.18, s.sharkVY * 0.0003)) : 0;
+      ctx.save();
+      ctx.translate(x, y - h / 2 + 8);
+      ctx.rotate(tilt);
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = "#ef4444";
+      ctx.fillRect(x - 30, y - 30, 60, 30);
+    }
+  }
+
+  function drawEntity(ctx: CanvasRenderingContext2D, e: Entity) {
+    if (e.kind === "pizza") {
+      const img = imgsRef.current.pizza;
+      const bob = Math.sin(e.phase) * 3;
+      const sz = 36;
+      // halo
+      const g = ctx.createRadialGradient(e.x + e.w / 2, e.y + e.h / 2 + bob, 2, e.x + e.w / 2, e.y + e.h / 2 + bob, sz);
+      g.addColorStop(0, "rgba(251,191,36,0.5)");
+      g.addColorStop(1, "rgba(251,191,36,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(e.x - 15, e.y - 15 + bob, e.w + 30, e.h + 30);
+      if (img && img.complete && img.naturalWidth > 0) {
+        ctx.drawImage(img, e.x - 4, e.y + bob - 4, sz, sz);
+      } else {
+        ctx.fillStyle = "#dc2626";
+        ctx.fillRect(e.x, e.y + bob, e.w, e.h);
+      }
+    } else if (e.kind === "cone") {
+      // plot orange
+      ctx.fillStyle = "#f97316";
+      ctx.beginPath();
+      ctx.moveTo(e.x + e.w / 2, e.y);
+      ctx.lineTo(e.x + e.w, e.y + e.h);
+      ctx.lineTo(e.x, e.y + e.h);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(e.x + 4, e.y + e.h * 0.45, e.w - 8, 5);
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(e.x - 4, e.y + e.h - 4, e.w + 8, 4);
+    } else if (e.kind === "puddle") {
+      // flaque
+      ctx.fillStyle = "rgba(56,189,248,0.85)";
+      ctx.beginPath();
+      ctx.ellipse(e.x + e.w / 2, e.y + e.h / 2, e.w / 2, e.h / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(14,165,233,0.9)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // reflet
+      ctx.fillStyle = "rgba(255,255,255,0.6)";
+      ctx.beginPath();
+      ctx.ellipse(e.x + e.w * 0.35, e.y + e.h * 0.35, e.w * 0.18, e.h * 0.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (e.kind === "trash") {
+      // poubelle
+      ctx.fillStyle = "#475569";
+      ctx.fillRect(e.x, e.y + 6, e.w, e.h - 6);
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(e.x - 3, e.y, e.w + 6, 8);
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillRect(e.x + 4, e.y + 12, 3, e.h - 18);
+      ctx.fillRect(e.x + e.w - 7, e.y + 12, 3, e.h - 18);
+      // détritus
+      ctx.fillStyle = "#84cc16";
+      ctx.beginPath(); ctx.arc(e.x + e.w * 0.3, e.y + 4, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fbbf24";
+      ctx.beginPath(); ctx.arc(e.x + e.w * 0.7, e.y + 5, 2.5, 0, Math.PI * 2); ctx.fill();
+    } else if (e.kind === "car") {
+      // petite voiture
+      // ombre
+      ctx.fillStyle = "rgba(0,0,0,0.25)";
+      ctx.beginPath();
+      ctx.ellipse(e.x + e.w / 2, e.y + e.h + 2, e.w / 2, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // carrosserie
+      const cy = e.y + e.h * 0.45;
+      ctx.fillStyle = "#3b82f6";
+      // base
+      ctx.fillRect(e.x, cy, e.w, e.h * 0.4);
+      // toit
+      ctx.beginPath();
+      ctx.moveTo(e.x + 18, cy);
+      ctx.lineTo(e.x + 30, e.y + e.h * 0.1);
+      ctx.lineTo(e.x + e.w - 25, e.y + e.h * 0.1);
+      ctx.lineTo(e.x + e.w - 12, cy);
+      ctx.closePath();
+      ctx.fill();
+      // vitres
+      ctx.fillStyle = "#bae6fd";
+      ctx.beginPath();
+      ctx.moveTo(e.x + 22, cy - 2);
+      ctx.lineTo(e.x + 32, e.y + e.h * 0.18);
+      ctx.lineTo(e.x + e.w - 27, e.y + e.h * 0.18);
+      ctx.lineTo(e.x + e.w - 16, cy - 2);
+      ctx.closePath();
+      ctx.fill();
+      // phares
+      ctx.fillStyle = "#fef3c7";
+      ctx.fillRect(e.x - 2, cy + 4, 4, 8);
+      // roues
+      ctx.fillStyle = "#0f172a";
+      ctx.beginPath(); ctx.arc(e.x + 18, e.y + e.h - 4, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(e.x + e.w - 18, e.y + e.h - 4, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#cbd5e1";
+      ctx.beginPath(); ctx.arc(e.x + 18, e.y + e.h - 4, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(e.x + e.w - 18, e.y + e.h - 4, 3, 0, Math.PI * 2); ctx.fill();
+    } else if (e.kind === "customer") {
+      drawCustomer(ctx, e);
+    }
+  }
+
+  function drawCustomer(ctx: CanvasRenderingContext2D, e: Entity) {
+    const x = e.x + e.w / 2;
+    const baseY = e.y + e.h;
+    const bounce = Math.abs(Math.sin(e.phase * 1.5)) * 4;
+    const color = e.customerColor || "#fbbf24";
+
+    // halo arc-en-ciel pulsé pour bien indiquer "client"
+    const pulseR = 50 + Math.sin(e.phase * 2) * 6;
+    const halo = ctx.createRadialGradient(x, baseY - 30, 5, x, baseY - 30, pulseR);
+    halo.addColorStop(0, "rgba(255,255,255,0)");
+    halo.addColorStop(0.7, `${color}55`);
+    halo.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = halo;
+    ctx.fillRect(x - pulseR, baseY - 30 - pulseR, pulseR * 2, pulseR * 2);
+
+    // Petit animal stylisé (corps rond)
+    const bodyY = baseY - 28 - bounce;
+    // ombre
+    ctx.fillStyle = "rgba(0,0,0,0.2)";
+    ctx.beginPath();
+    ctx.ellipse(x, baseY - 2, 18, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // corps
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.ellipse(x, bodyY, 22, 26, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // ventre
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.beginPath();
+    ctx.ellipse(x, bodyY + 6, 12, 14, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // oreilles
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x - 14, bodyY - 18, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 14, bodyY - 18, 6, 0, Math.PI * 2); ctx.fill();
+    // yeux
+    ctx.fillStyle = "#0f172a";
+    ctx.beginPath(); ctx.arc(x - 7, bodyY - 4, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 7, bodyY - 4, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(x - 6, bodyY - 5, 1, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 8, bodyY - 5, 1, 0, Math.PI * 2); ctx.fill();
+    // sourire
+    ctx.strokeStyle = "#0f172a";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(x, bodyY + 2, 4, 0.2, Math.PI - 0.2);
+    ctx.stroke();
+    // bras levés (qui demandent une pizza)
+    ctx.fillStyle = color;
+    const armWave = Math.sin(e.phase * 4) * 3;
+    ctx.beginPath();
+    ctx.ellipse(x - 22, bodyY - 4 + armWave, 5, 9, -0.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x + 22, bodyY - 4 - armWave, 5, 9, 0.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Bulle "🍕?" au-dessus
+    const bx = x, by = e.y - 10;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.ellipse(bx, by, 18, 14, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#0f172a";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // pointe
+    ctx.beginPath();
+    ctx.moveTo(bx - 4, by + 12);
+    ctx.lineTo(bx, by + 20);
+    ctx.lineTo(bx + 4, by + 12);
+    ctx.closePath();
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.stroke();
+    // emoji
+    ctx.font = "16px system-ui";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "#0f172a";
+    ctx.fillText("🍕", bx, by + 1);
+  }
+
+  function drawPizzaStack(ctx: CanvasRenderingContext2D, x: number, y: number, count: number) {
+    if (count <= 0) return;
+    // mini pile de pizzas au-dessus du requin
+    for (let i = 0; i < count; i++) {
+      const py = y - i * 7;
+      ctx.fillStyle = "#dc2626";
+      ctx.fillRect(x - 12, py, 24, 6);
+      ctx.fillStyle = "#fff";
+      for (let j = 0; j < 3; j++) {
+        ctx.fillRect(x - 10 + j * 8, py + 1, 4, 4);
+      }
+      ctx.strokeStyle = "rgba(0,0,0,0.4)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - 12, py, 24, 6);
+    }
+  }
+
+  const restart = () => {
+    const s = stateRef.current;
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    s.sharkX = rect.width * 0.22;
+    s.sharkY = rect.height * GROUND_RATIO;
+    s.sharkVY = 0;
+    s.onGround = true;
+    s.jumpHold = 0;
+    s.jumping = false;
+    s.speed = 280;
+    s.distance = 0;
+    s.score = 0;
+    s.pizzas = 0;
+    s.delivered = 0;
+    s.combo = 0;
+    s.timeLeft = ROUND_DURATION;
+    s.invuln = 0;
+    s.shake = 0;
+    s.gameOver = false;
+    s.started = true;
+    s.entities = [];
+    s.spawnTimer = 0;
+    s.customerTimer = 6;
+    s.floatTexts = [];
+    s.flash = 0;
+    setGameOver(false);
+    setScore(0); setPizzas(0); setDelivered(0); setCombo(0);
+    setTimeLeft(ROUND_DURATION);
+    setStarted(true);
+  };
+
+  /* UI */
+  const timeColor =
+    timeLeft > 30 ? "from-emerald-400 to-emerald-600" :
+    timeLeft > 15 ? "from-amber-400 to-orange-500" :
+    "from-red-500 to-red-700";
 
   return (
-    <main style={{ minHeight: "100dvh", background: "#07111f", color: "white", fontFamily: "system-ui, sans-serif", overflow: "hidden" }}>
-      <div style={{ width: "100%", maxWidth: 1180, margin: "0 auto", padding: "10px 10px 14px" }}>
-        <header style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <div>
-            <div style={{ fontSize: "clamp(18px,4vw,30px)", fontWeight: 950, lineHeight: 1 }}>🍕 Sharky Pizza Run</div>
-            <div style={{ color: "#93c5fd", fontSize: 12, marginTop: 3 }}>Ville • scooter • livraisons • poursuite arcade</div>
-          </div>
-          <div style={{ display: "flex", gap: 6 }}>
-            <button aria-label="Son" onClick={() => setMuted(v => !v)} style={buttonStyle}>{muted ? <VolumeX size={19}/> : <Volume2 size={19}/>}</button>
-            <button aria-label="Pause" onClick={togglePause} style={buttonStyle}>{paused ? <Play size={19}/> : <Pause size={19}/>}</button>
-            <button aria-label="Recommencer" onClick={resetGame} style={buttonStyle}><RotateCcw size={19}/></button>
-          </div>
-        </header>
-
-        <section style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(0,1fr))", gap: 6, marginBottom: 7 }}>
-          <Hud icon={<Trophy size={15}/>} label="Score" value={hud.score.toLocaleString("fr-FR")} />
-          <Hud icon={<Pizza size={15}/>} label="Stock" value={`${hud.pizzas}/${MAX_PIZZAS}`} />
-          <Hud icon={<Pizza size={15}/>} label="Livrées" value={String(hud.delivered)} />
-          <Hud icon={<Clock size={15}/>} label="Temps" value={`${hud.time}s`} />
-          <Hud icon={<span>🏁</span>} label="Niveau" value={`${hud.level}/10`} />
-          <Hud icon={<span>❤️</span>} label="Vies" value={String(hud.lives)} />
-        </section>
-
-        <div style={{ position: "relative", height: "min(70dvh,680px)", minHeight: 430, borderRadius: 22, overflow: "hidden", border: "1px solid rgba(255,255,255,.16)", boxShadow: "0 22px 60px rgba(0,0,0,.38)", background: "#0f172a" }}>
-          <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block", touchAction: "none", cursor: "pointer" }} />
-
-          {!started && ended === "none" && (
-            <div style={overlayStyle}>
-              <div style={cardStyle}>
-                <div style={{ fontSize: 54 }}>🛵🍕</div>
-                <h1 style={{ margin: "4px 0 8px", fontSize: 28 }}>Prêt pour la tournée ?</h1>
-                <p style={{ margin: "0 0 12px", color: "#dbeafe", lineHeight: 1.45 }}>Tape ou maintiens l’écran pour sauter. Ramasse jusqu’à 5 pizzas et livre les clients. À partir des niveaux 5 et 8, la circulation et les barrages se corsent.</p>
-                <button onClick={startJump} style={primaryStyle}><Play size={20}/> DÉMARRER</button>
-              </div>
-            </div>
-          )}
-
-          {paused && ended === "none" && (
-            <div style={overlayStyle}>
-              <div style={cardStyle}>
-                <div style={{ fontSize: 48 }}>⏸️</div>
-                <h2>Pause</h2>
-                <button onClick={togglePause} style={primaryStyle}><Play size={20}/> REPRENDRE</button>
-              </div>
-            </div>
-          )}
-
-          {ended !== "none" && (
-            <div style={overlayStyle}>
-              <div style={cardStyle}>
-                <div style={{ fontSize: 58 }}>{ended === "win" ? "🏆🍕" : "🛵💨"}</div>
-                <h2 style={{ margin: "4px 0" }}>{ended === "win" ? "Champion ultime !" : "Fin de tournée"}</h2>
-                <p style={{ color: "#dbeafe" }}>Score : <b>{hud.score.toLocaleString("fr-FR")}</b> • Record : <b>{highScore.toLocaleString("fr-FR")}</b></p>
-                <button onClick={resetGame} style={primaryStyle}><RotateCcw size={20}/> REJOUER</button>
-              </div>
-            </div>
-          )}
-
-          {vito && ended === "none" && (
-            <button onClick={() => setVito(null)} style={{ position: "absolute", left: 12, bottom: 12, maxWidth: 440, textAlign: "left", border: "1px solid rgba(255,255,255,.25)", background: "rgba(12,18,30,.9)", color: "white", borderRadius: 16, padding: "10px 13px", boxShadow: "0 10px 30px rgba(0,0,0,.35)", backdropFilter: "blur(8px)" }}>
-              <div style={{ fontSize: 11, fontWeight: 900, color: "#fbbf24", letterSpacing: 1 }}>VITO</div>
-              <div style={{ fontSize: 13, lineHeight: 1.35 }}>{vito}</div>
-            </button>
-          )}
-
-          <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 5, pointerEvents: "none" }}>
-            {hud.combo >= 2 && <Badge text={`COMBO x${hud.combo}`} color="#a78bfa" />}
-            {hud.turbo > 0 && <Badge text={`⚡ ${Math.ceil(hud.turbo)}s`} color="#fbbf24" />}
-            {hud.shield > 0 && <Badge text={`🛡️ ${Math.ceil(hud.shield)}s`} color="#67e8f9" />}
-          </div>
+    <div className="fixed inset-0 bg-orange-200 overflow-hidden select-none">
+      {/* Top HUD */}
+      <div className="absolute top-3 left-3 right-3 z-20 flex items-center justify-between pointer-events-none">
+        <Link
+          to="/games"
+          className="pointer-events-auto w-9 h-9 flex items-center justify-center rounded-full bg-black/40 backdrop-blur-md text-white hover:bg-black/60"
+          aria-label="Retour"
+        >
+          <ArrowLeft size={18} />
+        </Link>
+        <div className="flex items-center gap-1.5 text-white text-xs font-bold">
+          <span className="px-2.5 py-1 rounded-full bg-black/45 backdrop-blur-md flex items-center gap-1">
+            <Trophy size={12} className="text-yellow-300" /> {score}
+          </span>
+          <span className="px-2.5 py-1 rounded-full bg-emerald-500/80 backdrop-blur-sm flex items-center gap-1">
+            🚚 {delivered}
+          </span>
+          <span className="px-2.5 py-1 rounded-full bg-amber-500/80 backdrop-blur-sm flex items-center gap-1">
+            <Pizza size={12} /> {pizzas}/{MAX_PIZZAS}
+          </span>
         </div>
-
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginTop: 8, color: "#94a3b8", fontSize: 12 }}>
-          <span>N{hud.level} — {LEVEL_NAMES[hud.level - 1]}</span>
-          <span>Record {highScore.toLocaleString("fr-FR")}</span>
-        </div>
+        <div className="w-9" />
       </div>
-    </main>
-  );
-}
 
-function Hud({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
-  return (
-    <div style={{ minWidth: 0, background: "rgba(15,23,42,.92)", border: "1px solid rgba(255,255,255,.1)", borderRadius: 11, padding: "6px 7px" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 4, color: "#93c5fd", fontSize: 10, whiteSpace: "nowrap", overflow: "hidden" }}>{icon}<span>{label}</span></div>
-      <div style={{ fontWeight: 900, fontSize: "clamp(13px,2.6vw,18px)", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div>
+      {/* Timer bar */}
+      <div className="absolute top-12 left-4 right-4 z-20 pointer-events-none">
+        <div className="flex items-center gap-2">
+          <Clock size={12} className="text-white drop-shadow" />
+          <div className="flex-1 h-2.5 bg-black/40 rounded-full overflow-hidden backdrop-blur-sm">
+            <div
+              className={`h-full bg-gradient-to-r ${timeColor} transition-all duration-150`}
+              style={{ width: `${(timeLeft / ROUND_DURATION) * 100}%` }}
+            />
+          </div>
+          <span className="text-white text-[11px] font-bold drop-shadow w-7 text-right">{timeLeft}s</span>
+        </div>
+        {combo > 1 && (
+          <div className="text-center text-yellow-300 text-xs font-black mt-1 drop-shadow animate-pulse">
+            🔥 Combo x{combo}
+          </div>
+        )}
+      </div>
+
+      {/* High score badge */}
+      <div className="absolute bottom-3 left-3 z-20 px-2.5 py-1 rounded-full bg-black/45 text-amber-200 text-[10px] font-semibold backdrop-blur-sm">
+        🏆 Record : {highScore}
+      </div>
+
+      {/* Help bottom */}
+      {started && !gameOver && (
+        <div className="absolute bottom-3 right-3 z-20 px-2.5 py-1 rounded-full bg-black/45 text-white/80 text-[10px] font-semibold backdrop-blur-sm">
+          Tap = saut
+        </div>
+      )}
+
+      {/* Canvas */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 w-full h-full touch-none"
+      />
+
+      {/* Game over */}
+      {gameOver && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="bg-gradient-to-b from-orange-500 to-red-600 border-2 border-yellow-300 rounded-2xl p-6 max-w-sm w-full mx-4 text-center text-white shadow-2xl">
+            <div className="text-5xl mb-2">{delivered >= 10 ? "🏆" : delivered >= 5 ? "🍕" : "🛵"}</div>
+            <h2 className="text-3xl font-black mb-1">
+              {timeLeft <= 0 ? "Temps écoulé !" : "Partie terminée"}
+            </h2>
+            <p className="text-yellow-100 text-sm mb-4">
+              {delivered >= 10 ? "Livreur d'élite !" : delivered >= 5 ? "Bonne tournée !" : "On retente ?"}
+            </p>
+            <div className="space-y-1 mb-4 bg-black/20 rounded-xl p-3">
+              <p className="text-white">Score : <span className="font-bold text-2xl text-yellow-200">{score}</span></p>
+              <p className="text-emerald-200">🚚 Livraisons : <span className="font-bold">{delivered}</span></p>
+            </div>
+            {score >= highScore && score > 0 && (
+              <p className="text-yellow-200 font-bold mb-3 animate-pulse">🌟 Nouveau record !</p>
+            )}
+            <div className="flex gap-2">
+              <button
+                onClick={restart}
+                className="flex-1 py-3 bg-yellow-400 text-orange-900 hover:bg-yellow-300 rounded-lg font-black"
+              >
+                Rejouer
+              </button>
+              <Link
+                to="/games"
+                className="flex-1 py-3 bg-black/30 hover:bg-black/40 rounded-lg font-bold flex items-center justify-center"
+              >
+                Menu
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
-function Badge({ text, color }: { text: string; color: string }) {
-  return <span style={{ background: "rgba(15,23,42,.9)", border: `1px solid ${color}`, color, borderRadius: 999, padding: "5px 8px", fontSize: 11, fontWeight: 900 }}>{text}</span>;
-}
-
-const buttonStyle: React.CSSProperties = {
-  border: "1px solid rgba(255,255,255,.15)",
-  background: "rgba(30,41,59,.9)",
-  color: "white",
-  width: 39,
-  height: 39,
-  borderRadius: 11,
-  display: "grid",
-  placeItems: "center",
-};
-
-const primaryStyle: React.CSSProperties = {
-  border: 0,
-  background: "linear-gradient(135deg,#f59e0b,#ef4444)",
-  color: "white",
-  borderRadius: 14,
-  padding: "12px 18px",
-  fontWeight: 950,
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  gap: 8,
-  boxShadow: "0 10px 26px rgba(239,68,68,.28)",
-};
-
-const overlayStyle: React.CSSProperties = {
-  position: "absolute",
-  inset: 0,
-  display: "grid",
-  placeItems: "center",
-  background: "rgba(2,6,23,.56)",
-  backdropFilter: "blur(5px)",
-  padding: 18,
-};
-
-const cardStyle: React.CSSProperties = {
-  width: "min(92%,460px)",
-  textAlign: "center",
-  background: "rgba(15,23,42,.94)",
-  border: "1px solid rgba(255,255,255,.16)",
-  borderRadius: 22,
-  padding: 20,
-  boxShadow: "0 24px 70px rgba(0,0,0,.45)",
-};
