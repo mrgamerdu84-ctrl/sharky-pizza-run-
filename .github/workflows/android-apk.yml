@@ -1,0 +1,80 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'index.html'
+      - 'capacitor.config.ts'
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build web game
+        run: npm run build
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf android
+          npx cap add android
+          npx cap sync android
+          chmod +x android/gradlew
+
+      - name: Build installable debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Prepare APK
+        shell: bash
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk Sharky-Pizza-Run.apk
+          test -s Sharky-Pizza-Run.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sharky-Pizza-Run-APK
+          path: Sharky-Pizza-Run.apk
+          if-no-files-found: error
+
+      - name: Publish latest APK release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release delete android-apk-latest --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create android-apk-latest Sharky-Pizza-Run.apk \
+            --target "$GITHUB_SHA" \
+            --title 'Sharky Pizza Run — APK Android' \
+            --notes 'APK Android autonome du jeu Sharky Pizza Run.'
